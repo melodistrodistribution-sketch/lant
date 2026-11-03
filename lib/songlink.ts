@@ -16,6 +16,13 @@ export interface EntityData {
 }
 
 import { cacheLife } from "next/cache";
+import {
+  getSpotifyEmbedTrack,
+  isMatchingMusicVideo,
+  isSameRecording,
+  MusicResolutionError,
+  type RecordingIdentity,
+} from "./music-metadata";
 
 // --- Platform URL builders -------------------------------------------------
 const PLATFORM_URLS: Record<string, Record<string, (id: string) => string>> = {
@@ -83,8 +90,8 @@ interface ResolvedEntity {
 
 function emptyEntity(platform: string, type: string, platformId: string): ResolvedEntity {
   return {
-    name: type === "artist" ? "Artist" : type === "song" ? "Song" : type === "album" ? "Album" : type === "podcast" ? "Podcast" : "Audiobook",
-    artist: type === "artist" ? null : "Artist",
+    name: "",
+    artist: null,
     image: null,
     year: null,
     links: { [platform]: buildPlatformUrl(platform, type, platformId) },
@@ -127,7 +134,8 @@ async function deezerGet<T>(path: string): Promise<T | null> {
   try {
     const response = await fetch(`https://api.deezer.com${path}`, { next: { revalidate: 3600 } });
     if (!response.ok) return null;
-    return (await response.json()) as T;
+    const data = await response.json();
+    return data?.error ? null : data as T;
   } catch {
     return null;
   }
@@ -139,6 +147,25 @@ async function getDeezerTrack(id: string): Promise<DeezerTrack | null> {
 
 async function getDeezerTrackByIsrc(isrc: string): Promise<DeezerTrack | null> {
   return deezerGet<DeezerTrack>(`/track/isrc:${encodeURIComponent(isrc)}`);
+}
+
+async function findDeezerRecording(base: ResolvedEntity): Promise<DeezerTrack | null> {
+  try {
+    const url = `https://api.deezer.com/search/track?q=${encodeURIComponent(`${base.name} ${base.artist}`)}&limit=25`;
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(8000),
+      next: { revalidate: 3600 },
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const match = data.data?.find((track: DeezerTrack) => isSameRecording(
+      { name: base.name, artist: base.artist, duration: base.tracks[0]?.duration },
+      { name: track.title, artist: track.artist?.name || null, duration: track.duration },
+    ));
+    return match?.id ? await getDeezerTrack(String(match.id)) : null;
+  } catch {
+    return null;
+  }
 }
 
 async function searchDeezerAlbumArtist(
@@ -212,13 +239,39 @@ async function searchITunes(
 
 // iTunes/Apple Music song search by title + artist (keyless). Returns the
 // music.apple.com song URL (trackViewUrl or a constructed /album/[..]/id?i=).
-async function searchITunesSong(query: string): Promise<string | null> {
+async function searchITunesSong(base: ResolvedEntity): Promise<string | null> {
   try {
-    const url = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&entity=song&limit=5`;
-    const response = await fetch(url, { next: { revalidate: 3600 } });
+    const url = `https://itunes.apple.com/search?term=${encodeURIComponent(`${base.name} ${base.artist}`)}&entity=song&limit=100`;
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(8000),
+      next: { revalidate: 3600 },
+    });
     if (!response.ok) return null;
     const data = await response.json();
-    const result = data.results?.find((r: any) => r.kind === "song" && r.trackId);
+    const matches = (r: any) => r.kind === "song" && r.trackId
+      && isSameRecording(
+        { name: base.name, artist: base.artist, duration: base.tracks[0]?.duration },
+        { name: r.trackName, artist: r.artistName, duration: typeof r.trackTimeMillis === "number" ? r.trackTimeMillis / 1000 : null },
+      );
+    let result = data.results?.find(matches);
+    // Search may omit a known song while the artist's catalog still contains
+    // it. Resolve the verified artist first, then match within that catalog.
+    if (!result) {
+      const artistIds = [...new Set<number>((data.results || [])
+        .filter((r: any) => r.artistName?.toLowerCase() === base.artist?.toLowerCase()
+          && Number.isSafeInteger(r.artistId))
+        .map((r: any) => r.artistId))].slice(0, 2);
+      for (const artistId of artistIds) {
+        const lookup = await fetch(`https://itunes.apple.com/lookup?id=${artistId}&entity=song&limit=200`, {
+          signal: AbortSignal.timeout(8000),
+          next: { revalidate: 3600 },
+        });
+        if (!lookup.ok) continue;
+        const catalog = await lookup.json();
+        result = catalog.results?.find(matches);
+        if (result) break;
+      }
+    }
     if (!result) return null;
     if (result.trackViewUrl) return result.trackViewUrl;
     if (result.trackId && result.collectionId) {
@@ -276,7 +329,7 @@ async function spGet<T>(path: string): Promise<T | null> {
   }
 }
 
-async function getSpotifyTrack(id: string): Promise<{ isrc: string | null; name: string; artist: string; image: string | null; year: number | null; previewUrl: string | null } | null> {
+async function getSpotifyTrack(id: string): Promise<{ isrc: string | null; name: string; artist: string; image: string | null; year: number | null; previewUrl: string | null; duration: number | null } | null> {
   const data = await spGet<any>(`/tracks/${id}`);
   if (!data) return null;
   return {
@@ -286,6 +339,7 @@ async function getSpotifyTrack(id: string): Promise<{ isrc: string | null; name:
     image: data.album?.images?.[0]?.url || null,
     year: data.album?.release_date ? new Date(data.album.release_date).getFullYear() : null,
     previewUrl: data.preview_url || null,
+    duration: typeof data.duration_ms === "number" ? Math.round(data.duration_ms / 1000) : null,
   };
 }
 
@@ -357,7 +411,11 @@ async function youtubeOembed(platformId: string): Promise<{ name: string; artist
 
 // Generalized YouTube search via ytInitialData scraping (keyless).
 // kind: "video" or "channel". Returns a canonical URL for the first match.
-async function youtubeSearch(query: string, kind: "video" | "channel"): Promise<string | null> {
+async function youtubeSearch(
+  query: string,
+  kind: "video" | "channel",
+  expected?: RecordingIdentity,
+): Promise<string | null> {
   try {
     const sp =
       kind === "channel"
@@ -365,6 +423,7 @@ async function youtubeSearch(query: string, kind: "video" | "channel"): Promise<
         : "&sp=EgIQAQ%253D%253D"; // YouTube's "Videos" filter
     const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}${sp}`;
     const response = await fetch(url, {
+      signal: AbortSignal.timeout(8000),
       headers: { "Accept-Language": "en-US,en;q=0.9" },
       next: { revalidate: 86400 },
     });
@@ -395,6 +454,13 @@ async function youtubeSearch(query: string, kind: "video" | "channel"): Promise<
         } else {
           const video = item?.videoRenderer;
           if (video?.videoId && video?.lengthText?.simpleText) {
+            if (expected) {
+              const title = video.title?.runs?.map((run: any) => run.text).join("")
+                || video.title?.simpleText || "";
+              const channel = video.ownerText?.runs?.map((run: any) => run.text).join("")
+                || video.longBylineText?.runs?.map((run: any) => run.text).join("") || "";
+              if (!isMatchingMusicVideo(expected, title, channel)) continue;
+            }
             return `https://www.youtube.com/watch?v=${video.videoId}`;
           }
         }
@@ -679,6 +745,22 @@ async function resolveSource(
   type: string,
   platformId: string
 ): Promise<ResolvedEntity> {
+  const entity = await resolveSourceUnchecked(platform, type, platformId);
+  if (!entity.name?.trim() || entity.name === "Unknown"
+    || (type !== "artist" && (!entity.artist?.trim() || entity.artist === "Unknown"))) {
+    throw new MusicResolutionError(
+      `Could not retrieve verified ${type} metadata from ${platform}. The provider may be unavailable or require credentials.`,
+      502, "INCOMPLETE_METADATA", platform,
+    );
+  }
+  return entity;
+}
+
+async function resolveSourceUnchecked(
+  platform: string,
+  type: string,
+  platformId: string
+): Promise<ResolvedEntity> {
   const entity = emptyEntity(platform, type, platformId);
 
   // Deezer source: full metadata + ISRC keyless
@@ -731,8 +813,17 @@ async function resolveSource(
         entity.year = spotify.year;
         entity.isrc = spotify.isrc;
         entity.previewUrl = spotify.previewUrl;
+        entity.tracks = [{ name: spotify.name, duration: spotify.duration }];
         return entity;
       }
+      const embedded = await getSpotifyEmbedTrack(platformId);
+      entity.name = embedded.name;
+      entity.artist = embedded.artist;
+      entity.image = embedded.image;
+      entity.year = embedded.year;
+      entity.previewUrl = embedded.previewUrl;
+      entity.tracks = [{ name: embedded.name, duration: embedded.duration || null }];
+      return entity;
     } else if (type === "album") {
       const album = await getSpotifyAlbum(platformId);
       if (album) {
@@ -794,15 +885,18 @@ async function resolveSource(
 
 // --- ISRC propagator: given isrc, find links on all supported platforms ------
 async function resolveLinksFromIsrc(
-  isrc: string,
+  isrc: string | null,
   sourcePlatform: string,
   base: ResolvedEntity
 ): Promise<void> {
   // Deezer: direct ISRC lookup (keyless)
   if (sourcePlatform !== "deezer") {
-    const deezerTrack = await getDeezerTrackByIsrc(isrc);
+    const deezerTrack = isrc
+      ? await getDeezerTrackByIsrc(isrc)
+      : await findDeezerRecording(base);
     if (deezerTrack) {
       base.links.deezer = deezerTrack.link;
+      isrc = isrc || deezerTrack.isrc || null;
       // enrich metadata if missing
       if (base.name === "Song" || !base.name) {
         base.name = deezerTrack.title;
@@ -813,13 +907,13 @@ async function resolveLinksFromIsrc(
   }
 
   // Spotify: ISRC search (only with keys)
-  if (sourcePlatform !== "spotify") {
+  if (isrc && sourcePlatform !== "spotify") {
     const spotifyUrl = await spotifySearchTrackByIsrc(isrc);
     if (spotifyUrl) base.links.spotify = spotifyUrl;
   }
 
   // Tidal: ISRC lookup via public GraphQL API (keyless)
-  if (sourcePlatform !== "tidal") {
+  if (isrc && sourcePlatform !== "tidal") {
     const tidalUrl = await tidalSearchTrackByIsrc(isrc);
     if (tidalUrl) base.links.tidal = tidalUrl;
   }
@@ -830,14 +924,14 @@ async function resolveLinksFromIsrc(
     if (base.name && base.name !== "Song") queryParts.push(base.name);
     if (base.artist) queryParts.push(base.artist);
     if (queryParts.length) {
-      const appleUrl = await searchITunesSong(queryParts.join(" "));
+      const appleUrl = await searchITunesSong(base);
       if (appleUrl) base.links.apple = appleUrl;
     }
   }
 
   // Amazon Music: ISRC search (only with keys)
   if (sourcePlatform !== "amazon") {
-    const amazonUrl = await amazonMusicSearch("", "track", isrc);
+    const amazonUrl = await amazonMusicSearch(`${base.name} ${base.artist}`, "track", isrc || undefined);
     if (amazonUrl) base.links.amazonmusic = amazonUrl;
   }
 
@@ -847,21 +941,16 @@ async function resolveLinksFromIsrc(
     if (base.name && base.name !== "Song") queryParts.push(base.name);
     if (base.artist) queryParts.push(base.artist);
     if (queryParts.length) {
-      const ytUrl = await youtubeSearchTrack(`${queryParts.join(" ")} official`);
-      if (ytUrl) base.links.youtube = ytUrl;
+      const ytUrl = await youtubeSearch(`${queryParts.join(" ")} official`, "video", {
+        name: base.name, artist: base.artist, duration: base.tracks[0]?.duration,
+      });
+      if (ytUrl) {
+        base.links.youtube = ytUrl;
+        base.links.youtubemusic = ytUrl.replace("www.youtube.com", "music.youtube.com");
+      }
     }
   }
 
-  // YouTube Music: keyless, reuses the same YouTube search as a music URL
-  if (sourcePlatform !== "youtube") {
-    const queryParts: string[] = [];
-    if (base.name && base.name !== "Song") queryParts.push(base.name);
-    if (base.artist) queryParts.push(base.artist);
-    if (queryParts.length) {
-      const ytmUrl = await ytMusicSearch(`${queryParts.join(" ")} official`, "video");
-      if (ytmUrl) base.links.youtubemusic = ytmUrl;
-    }
-  }
 }
 
 // --- Album/artist propagator: given metadata, find links on all platforms ------
@@ -943,8 +1032,8 @@ export async function fetchMusicData(
   const entity = await resolveSource(platform, type, platformId);
 
   // 2. For songs with ISRC: find links on other platforms
-  if (type === "song" && entity.isrc) {
-    await resolveLinksFromIsrc(entity.isrc, platform, entity);
+  if (type === "song") {
+    await resolveLinksFromIsrc(entity.isrc || null, platform, entity);
   }
 
   // 3. For albums/artists: find links across all supporting platforms
@@ -991,6 +1080,17 @@ export async function getMusicDataCached(
   platform: string,
   type: string,
   platformId: string
+): Promise<EntityData> {
+  // Version the key so previously cached placeholder responses cannot survive
+  // this repair. Keep the existing persistent KV adapter and namespace intact.
+  return getVerifiedMusicDataCached(platform, type, platformId, "verified-metadata-v1");
+}
+
+async function getVerifiedMusicDataCached(
+  platform: string,
+  type: string,
+  platformId: string,
+  _cacheVersion: string,
 ): Promise<EntityData> {
   "use cache";
   cacheLife({

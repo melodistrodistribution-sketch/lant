@@ -3,6 +3,7 @@ import { linkedId } from "@/lib/linked-id";
 import { getMusicDataCached } from "@/lib/songlink";
 import { checkRateLimit, getRateLimitHeaders } from "@/lib/rate-limit";
 import type { NextRequest } from "next/server";
+import { MusicResolutionError } from "@/lib/music-metadata";
 
 export async function POST(request: NextRequest) {
   const clientIp = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
@@ -50,9 +51,17 @@ export async function POST(request: NextRequest) {
   try {
     data = await getMusicDataCached(parsed.platform, parsed.entityType, parsed.platformId);
   } catch (error) {
+    const failure = error instanceof MusicResolutionError ? error : null;
     return Response.json(
-      { error: error instanceof Error ? error.message : "Failed to resolve music data." },
-      { status: 500, headers: { ...corsHeaders(), ...rateLimitHeaders } }
+      {
+        error: error instanceof Error ? error.message : "Failed to resolve music data.",
+        ...(failure && {
+          code: failure.code,
+          provider: failure.provider,
+          upstreamStatus: failure.upstreamStatus,
+        }),
+      },
+      { status: failure?.status || 500, headers: { ...corsHeaders(), ...rateLimitHeaders } }
     );
   }
 
