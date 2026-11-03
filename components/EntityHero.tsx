@@ -1,6 +1,7 @@
 "use client";
 
 import type { EntityData } from "@/lib/songlink";
+import SongEntityHero from "./SongEntityHero";
 import { useState, useRef, useEffect } from "react";
 import { useI18n } from "@/lib/i18n";
 import { generateQRMatrix, qrToSVG } from "@/lib/qr";
@@ -33,6 +34,11 @@ function formatDuration(seconds: number | null): string {
 type ShareTab = "links" | "qr" | "embed";
 
 export default function EntityHero({ data, type }: EntityHeroProps) {
+  if (type === "song") return <SongEntityHero data={data} type={type} />;
+  return <LegacyEntityHero data={data} type={type} />;
+}
+
+function LegacyEntityHero({ data, type }: EntityHeroProps) {
   const { t } = useI18n();
   const { name, artist, image, links, year, previewUrl, lyrics } = data;
   const imageSrc = image || "/images.svg";

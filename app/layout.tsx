@@ -1,6 +1,5 @@
 import type { Metadata, Viewport } from "next";
-import Link from "next/link";
-import { FaGithub } from "react-icons/fa";
+import SiteCorner from "@/components/SiteCorner";
 import { I18nProvider } from "@/lib/i18n";
 import "./globals.css";
 
@@ -214,9 +213,7 @@ export default function RootLayout({
           }}
         />
         <I18nProvider>
-          <Link href="https://github.com/OseMine/linked" aria-label="GitHub repository" className="github-link">
-            <FaGithub size={20} />
-          </Link>
+          <SiteCorner />
           {children}
         </I18nProvider>
       </body>
