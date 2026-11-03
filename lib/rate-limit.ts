@@ -4,6 +4,18 @@ interface RateLimitEntry {
 }
 
 const rateLimitStore = new Map<string, RateLimitEntry>();
+let nextCleanupTime = 0;
+
+function cleanupExpiredEntries(now: number): void {
+  if (now < nextCleanupTime) return;
+
+  for (const [key, entry] of rateLimitStore.entries()) {
+    if (now >= entry.resetTime) {
+      rateLimitStore.delete(key);
+    }
+  }
+  nextCleanupTime = now + 60_000;
+}
 
 export interface RateLimitConfig {
   maxRequests: number;
@@ -20,6 +32,8 @@ export function checkRateLimit(
   config: RateLimitConfig = DEFAULT_CONFIG
 ): { allowed: boolean; remaining: number; resetIn: number } {
   const now = Date.now();
+  // Workers cannot start timers at module scope; clean up during requests.
+  cleanupExpiredEntries(now);
   const entry = rateLimitStore.get(identifier);
 
   if (!entry || now >= entry.resetTime) {
@@ -52,12 +66,3 @@ export function getRateLimitHeaders(result: ReturnType<typeof checkRateLimit>): 
     "X-RateLimit-Reset": String(Math.ceil(result.resetIn / 1000)),
   };
 }
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, entry] of rateLimitStore.entries()) {
-    if (now >= entry.resetTime) {
-      rateLimitStore.delete(key);
-    }
-  }
-}, 60000);
