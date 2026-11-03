@@ -5,6 +5,7 @@ import { useState, useRef, useEffect } from "react";
 import { useI18n } from "@/lib/i18n";
 import { generateQRMatrix, qrToSVG } from "@/lib/qr";
 import { addToHistory } from "@/lib/history";
+import { providerStatusKey } from "@/lib/provider-status";
 
 interface EntityHeroProps {
   data: EntityData;
@@ -177,10 +178,13 @@ export default function EntityHero({ data, type }: EntityHeroProps) {
           {PLATFORMS.map((p) => {
             const href = getHref(p);
             if (!href) {
+              const outcome = data.providerStatus?.[p.key];
               return (
-                <div key={p.key} className="platform unavailable">
+                <div key={p.key} className="platform unavailable"
+                  data-provider-status={outcome?.status || "unverified"}
+                  title={outcome?.message}>
               <img src={`https://cdn.jsdelivr.net/npm/simple-icons@9/icons/${p.icon === "amazon" ? "amazon" : p.icon}.svg`} alt="" className="platform-icon" />
-                  <span>{t("entity.notOn", { platform: p.name })}</span>
+                  <span>{t(providerStatusKey(outcome), { platform: p.name })}</span>
                 </div>
               );
             }

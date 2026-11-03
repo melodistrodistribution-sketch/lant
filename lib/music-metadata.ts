@@ -20,20 +20,40 @@ export interface RecordingIdentity {
 function normalize(value: string): string {
   if (typeof value !== "string") return "";
   return value.normalize("NFKD").replace(/\p{M}/gu, "")
-    .toLowerCase().replace(/&/g, " and ").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    .toLowerCase().replace(/ø/g, "o").replace(/ł/g, "l")
+    .replace(/&/g, " and ").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+}
+
+function artistCredits(value: string): string[] {
+  return [...new Set(value.split(/\s*(?:,|&|;|\band\b|\bfeat\.?|\bfeaturing\b)\s*/i)
+    .map(normalize).filter(Boolean))].sort();
+}
+
+export function sameArtistCredits(left: string, right: string): boolean {
+  const a = artistCredits(left);
+  const b = artistCredits(right);
+  return a.length > 0 && a.length === b.length && a.every((credit, index) => credit === b[index]);
 }
 
 /** Never select a different artist or remix just because it ranks first. */
+export function sameRecordingVersion(
+  expected: Pick<RecordingIdentity, "name" | "duration">,
+  candidate: Pick<RecordingIdentity, "name" | "duration">,
+): boolean {
+  if (!expected.name || !candidate.name || normalize(expected.name) !== normalize(candidate.name)) return false;
+  return expected.duration == null || candidate.duration == null
+    || (Number.isFinite(expected.duration) && Number.isFinite(candidate.duration)
+      && Math.abs(expected.duration - candidate.duration) <= 4);
+}
+
 export function isSameRecording(
   expected: RecordingIdentity,
   candidate: RecordingIdentity,
 ): boolean {
   if (!expected.artist || !candidate.artist) return false;
-  if (!expected.name || !candidate.name) return false;
-  if (normalize(expected.name) !== normalize(candidate.name)) return false;
-  if (normalize(expected.artist) !== normalize(candidate.artist)) return false;
-  return expected.duration == null || candidate.duration == null
-    || Math.abs(expected.duration - candidate.duration) <= 4;
+  if (!sameRecordingVersion(expected, candidate)) return false;
+  if (!sameArtistCredits(expected.artist, candidate.artist)) return false;
+  return true;
 }
 
 export function isMatchingMusicVideo(
@@ -43,11 +63,11 @@ export function isMatchingMusicVideo(
 ): boolean {
   if (!expected.artist) return false;
   const name = normalize(expected.name);
-  const artist = normalize(expected.artist);
+  const artists = artistCredits(expected.artist);
   const video = normalize(title);
   const owner = normalize(channel);
-  if (!name || !artist || !(` ${video} `).includes(` ${name} `)) return false;
-  if (!video.includes(artist) && !owner.includes(artist)) return false;
+  if (!name || !artists.length || !(` ${video} `).includes(` ${name} `)) return false;
+  if (!artists.every((artist) => video.includes(artist) || owner.includes(artist))) return false;
   // Do not substitute covers, live performances, or altered-speed recordings.
   return !["cover", "karaoke", "remix", "live", "sped up", "slowed"]
     .some((variant) => (` ${video} `).includes(` ${variant} `)

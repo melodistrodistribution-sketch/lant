@@ -13,13 +13,15 @@ export interface EntityData {
   } | null;
   entityType?: "song" | "album" | "artist" | "podcast" | "audiobook";
   regionUnavailable?: boolean;
+  providerStatus?: Record<string, ProviderMatch>;
 }
 
 import { cacheLife } from "next/cache";
+import { matchAppleRecording, matchDeezerRecording, matchTidalRecording } from "./provider-matching";
+import type { ProviderMatch } from "./provider-status";
 import {
   getSpotifyEmbedTrack,
   isMatchingMusicVideo,
-  isSameRecording,
   MusicResolutionError,
   type RecordingIdentity,
 } from "./music-metadata";
@@ -86,6 +88,7 @@ interface ResolvedEntity {
   } | null;
   entityType?: "song" | "album" | "artist" | "podcast" | "audiobook";
   regionUnavailable?: boolean;
+  providerStatus?: Record<string, ProviderMatch>;
 }
 
 function emptyEntity(platform: string, type: string, platformId: string): ResolvedEntity {
@@ -143,29 +146,6 @@ async function deezerGet<T>(path: string): Promise<T | null> {
 
 async function getDeezerTrack(id: string): Promise<DeezerTrack | null> {
   return deezerGet<DeezerTrack>(`/track/${id}`);
-}
-
-async function getDeezerTrackByIsrc(isrc: string): Promise<DeezerTrack | null> {
-  return deezerGet<DeezerTrack>(`/track/isrc:${encodeURIComponent(isrc)}`);
-}
-
-async function findDeezerRecording(base: ResolvedEntity): Promise<DeezerTrack | null> {
-  try {
-    const url = `https://api.deezer.com/search/track?q=${encodeURIComponent(`${base.name} ${base.artist}`)}&limit=25`;
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(8000),
-      next: { revalidate: 3600 },
-    });
-    if (!response.ok) return null;
-    const data = await response.json();
-    const match = data.data?.find((track: DeezerTrack) => isSameRecording(
-      { name: base.name, artist: base.artist, duration: base.tracks[0]?.duration },
-      { name: track.title, artist: track.artist?.name || null, duration: track.duration },
-    ));
-    return match?.id ? await getDeezerTrack(String(match.id)) : null;
-  } catch {
-    return null;
-  }
 }
 
 async function searchDeezerAlbumArtist(
@@ -232,52 +212,6 @@ async function searchITunes(
     return result.collectionId
       ? `https://music.apple.com/us/album/${result.collectionName?.replace(/\s+/g, "-")}/id${result.collectionId}`
       : null;
-  } catch {
-    return null;
-  }
-}
-
-// iTunes/Apple Music song search by title + artist (keyless). Returns the
-// music.apple.com song URL (trackViewUrl or a constructed /album/[..]/id?i=).
-async function searchITunesSong(base: ResolvedEntity): Promise<string | null> {
-  try {
-    const url = `https://itunes.apple.com/search?term=${encodeURIComponent(`${base.name} ${base.artist}`)}&entity=song&limit=100`;
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(8000),
-      next: { revalidate: 3600 },
-    });
-    if (!response.ok) return null;
-    const data = await response.json();
-    const matches = (r: any) => r.kind === "song" && r.trackId
-      && isSameRecording(
-        { name: base.name, artist: base.artist, duration: base.tracks[0]?.duration },
-        { name: r.trackName, artist: r.artistName, duration: typeof r.trackTimeMillis === "number" ? r.trackTimeMillis / 1000 : null },
-      );
-    let result = data.results?.find(matches);
-    // Search may omit a known song while the artist's catalog still contains
-    // it. Resolve the verified artist first, then match within that catalog.
-    if (!result) {
-      const artistIds = [...new Set<number>((data.results || [])
-        .filter((r: any) => r.artistName?.toLowerCase() === base.artist?.toLowerCase()
-          && Number.isSafeInteger(r.artistId))
-        .map((r: any) => r.artistId))].slice(0, 2);
-      for (const artistId of artistIds) {
-        const lookup = await fetch(`https://itunes.apple.com/lookup?id=${artistId}&entity=song&limit=200`, {
-          signal: AbortSignal.timeout(8000),
-          next: { revalidate: 3600 },
-        });
-        if (!lookup.ok) continue;
-        const catalog = await lookup.json();
-        result = catalog.results?.find(matches);
-        if (result) break;
-      }
-    }
-    if (!result) return null;
-    if (result.trackViewUrl) return result.trackViewUrl;
-    if (result.trackId && result.collectionId) {
-      return `https://music.apple.com/us/album/${result.collectionName?.replace(/\s+/g, "-")}/id${result.collectionId}?i=${result.trackId}`;
-    }
-    return null;
   } catch {
     return null;
   }
@@ -585,29 +519,6 @@ async function tidalGetTrack(id: string): Promise<TidalTrackGQL | null> {
   }
 }
 
-// Tidal track search by ISRC via the credentialed OpenAPI (v2).
-// Requires TIDAL_CLIENT_ID / TIDAL_CLIENT_SECRET. Degrades gracefully (returns
-// null) without them.
-async function tidalSearchTrackByIsrc(isrc: string): Promise<string | null> {
-  const clientId = process.env.TIDAL_CLIENT_ID;
-  const clientSecret = process.env.TIDAL_CLIENT_SECRET;
-  if (!clientId || !clientSecret) return null;
-  const token = await getTidalAccessToken(clientId, clientSecret);
-  if (!token) return null;
-  try {
-    const response = await fetch(
-      `https://openapi.tidal.com/v2/tracks?filter[isrc]=${encodeURIComponent(isrc)}&countryCode=US&page[size]=1`,
-      { headers: { Authorization: `Bearer ${token}` }, next: { revalidate: 3600 } }
-    );
-    if (!response.ok) return null;
-    const json = await response.json();
-    const node = json?.data?.[0];
-    return node ? `https://tidal.com/browse/track/${node.id}` : null;
-  } catch {
-    return null;
-  }
-}
-
 // Amazon Music search (credentialed OpenAPI v2). Requires AMAZON_MUSIC_API_KEY
 // and AMAZON_MUSIC_CLIENT_ID/CLIENT_SECRET. Returns null (degrades gracefully)
 // when credentials are absent. Search filters: field,query.
@@ -889,44 +800,27 @@ async function resolveLinksFromIsrc(
   sourcePlatform: string,
   base: ResolvedEntity
 ): Promise<void> {
-  // Deezer: direct ISRC lookup (keyless)
-  if (sourcePlatform !== "deezer") {
-    const deezerTrack = isrc
-      ? await getDeezerTrackByIsrc(isrc)
-      : await findDeezerRecording(base);
-    if (deezerTrack) {
-      base.links.deezer = deezerTrack.link;
-      isrc = isrc || deezerTrack.isrc || null;
-      // enrich metadata if missing
-      if (base.name === "Song" || !base.name) {
-        base.name = deezerTrack.title;
-        base.artist = deezerTrack.artist?.name || base.artist;
-        base.image = deezerTrack.album?.cover_xl || base.image;
-      }
-    }
+  const expected = { name: base.name, artist: base.artist, duration: base.tracks[0]?.duration };
+  const status = base.providerStatus ||= {};
+  const [apple, deezer] = await Promise.all([
+    sourcePlatform === "apple" ? Promise.resolve<ProviderMatch>({ status: "matched", url: base.links.apple }) : matchAppleRecording(expected),
+    sourcePlatform === "deezer" ? Promise.resolve<ProviderMatch>({ status: "matched", url: base.links.deezer, isrc: isrc || undefined }) : matchDeezerRecording(expected, isrc),
+  ]);
+  status.apple = apple;
+  status.deezer = deezer;
+  if (apple.url) base.links.apple = apple.url;
+  if (deezer.url) base.links.deezer = deezer.url;
+  isrc = isrc || deezer.isrc || apple.isrc || null;
+  if (sourcePlatform !== "tidal") {
+    const tidal = await matchTidalRecording(expected, isrc);
+    status.tidal = tidal;
+    if (tidal.url) base.links.tidal = tidal.url;
   }
 
   // Spotify: ISRC search (only with keys)
   if (isrc && sourcePlatform !== "spotify") {
     const spotifyUrl = await spotifySearchTrackByIsrc(isrc);
     if (spotifyUrl) base.links.spotify = spotifyUrl;
-  }
-
-  // Tidal: ISRC lookup via public GraphQL API (keyless)
-  if (isrc && sourcePlatform !== "tidal") {
-    const tidalUrl = await tidalSearchTrackByIsrc(isrc);
-    if (tidalUrl) base.links.tidal = tidalUrl;
-  }
-
-  // Apple Music / iTunes: search by title + artist (keyless)
-  if (sourcePlatform !== "apple") {
-    const queryParts: string[] = [];
-    if (base.name && base.name !== "Song") queryParts.push(base.name);
-    if (base.artist) queryParts.push(base.artist);
-    if (queryParts.length) {
-      const appleUrl = await searchITunesSong(base);
-      if (appleUrl) base.links.apple = appleUrl;
-    }
   }
 
   // Amazon Music: ISRC search (only with keys)
@@ -1034,6 +928,24 @@ export async function fetchMusicData(
   // 2. For songs with ISRC: find links on other platforms
   if (type === "song") {
     await resolveLinksFromIsrc(entity.isrc || null, platform, entity);
+    const status = entity.providerStatus ||= {};
+    if (!entity.links.tidal && !status.tidal) status.tidal = {
+      status: "configuration_required", message: "Tidal catalog credentials are required.",
+    };
+    if (!entity.links.amazonmusic) status.amazonmusic = {
+      status: process.env.AMAZON_MUSIC_API_KEY && process.env.AMAZON_MUSIC_CLIENT_ID && process.env.AMAZON_MUSIC_CLIENT_SECRET
+        ? "temporary_error" : "configuration_required",
+      message: "Amazon Music matching requires configured catalog access and a verified result.",
+    };
+    if (!entity.links.bandcamp) status.bandcamp = {
+      status: "unsupported", message: "Automatic Bandcamp catalog matching is not supported.",
+    };
+    for (const key of ["spotify", "youtube", "youtubemusic"]) {
+      if (!entity.links[key]) status[key] = {
+        status: "temporary_error", message: "No verified result was returned; catalog absence has not been established.",
+      };
+    }
+    for (const [key, url] of Object.entries(entity.links)) status[key] = { status: "matched", url };
   }
 
   // 3. For albums/artists: find links across all supporting platforms
@@ -1083,7 +995,7 @@ export async function getMusicDataCached(
 ): Promise<EntityData> {
   // Version the key so previously cached placeholder responses cannot survive
   // this repair. Keep the existing persistent KV adapter and namespace intact.
-  return getVerifiedMusicDataCached(platform, type, platformId, "verified-metadata-v1");
+  return getVerifiedMusicDataCached(platform, type, platformId, "provider-status-v2");
 }
 
 async function getVerifiedMusicDataCached(
@@ -1093,11 +1005,14 @@ async function getVerifiedMusicDataCached(
   _cacheVersion: string,
 ): Promise<EntityData> {
   "use cache";
+  const data = await fetchMusicData(platform, type, platformId);
+  const retrySoon = Object.values(data.providerStatus || {}).some((result) =>
+    result.status === "temporary_error" || result.status === "configuration_required");
   cacheLife({
-    revalidate: 3600,
-    expire: 86400,
+    revalidate: retrySoon ? 30 : 3600,
+    expire: retrySoon ? 120 : 86400,
   });
-  return fetchMusicData(platform, type, platformId);
+  return data;
 }
 
 export async function getArtistMetadataCached(
